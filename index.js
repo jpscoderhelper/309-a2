@@ -29,8 +29,6 @@ const prisma = new PrismaClient();
 const SALT_ROUNDS = 10;
 const resetRateLimiter = new Map(); // ip -> lastTimestampMs
 const RESET_WINDOW_MS = 60 * 1000;
-const inMemoryEvents = [];
-let nextEventId = 1;
 
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
@@ -163,18 +161,6 @@ function toInt(v,def){
   return def
 }
 
-function parseBooleanInput(value) {
-  if (typeof value === "boolean") {
-    return value;
-  }
-  if (typeof value === "string") {
-    const normalized = value.trim().toLowerCase();
-    if (normalized === "true") return true;
-    if (normalized === "false") return false;
-  }
-  return undefined;
-}
-
 async function requireAuthRegular(req, res, next) {
   try {
     const rank = await resolveEffectiveRank(req)
@@ -235,15 +221,6 @@ async function resolveEffectiveRank(req) {
 // Create a new user
 app.post("/users", async (req, res) => {
   try {
-    if (!req.user) attachAuth(req);
-    const rank = await resolveEffectiveRank(req);
-    if (rank === undefined) {
-      return res.status(401).json({ error: "unauthorized" });
-    }
-    if (rank < ROLE_RANK.manager) {
-      return res.status(403).json({ error: "forbidden" });
-    }
-
     let { utorid, name, email } = req.body || {};
     utorid = (utorid || "").trim().toLowerCase();
     name   = (name   || "").trim();
@@ -282,9 +259,9 @@ app.post("/users", async (req, res) => {
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "duplicate" });
     console.error(e);
-    return res.status(500).json({ error: "internal" });
+    return res.status(500).json({ error: "server messed up" });
   }
-}
+});
 
 app.get("/users", async (req, res) => {
   try {
@@ -346,13 +323,6 @@ app.get("/users", async (req, res) => {
       where.lastLogin = activated ? { not: null } : null;
     }
 
-    where.NOT = {
-      OR: [
-        { utorid: { startsWith: "mock", mode: "insensitive" } },
-        { name: { startsWith: "mock", mode: "insensitive" } }
-      ]
-    };
-
     const skip = (pageNum - 1) * limitNum;
     const take = limitNum;
 
@@ -388,9 +358,9 @@ app.get("/users", async (req, res) => {
     return res.json({ count: total, results });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: "internal" });
+    return res.status(500).json({ error: "server broke" });
   }
-}
+});
 
 
 app.get("/users/:userId", checkRole, async (req,res)=>{
@@ -452,7 +422,7 @@ app.get("/users/:userId", checkRole, async (req,res)=>{
     res.json(out)
   }catch(e){
     console.error(e)
-    res.status(500).json({error:"internal"})
+    res.status(500).json({error:"server broke"})
   }
 });
 
@@ -504,7 +474,6 @@ app.post("/auth/tokens", async (req, res) => {
 
 app.patch("/users/me", requireAuthRegular, async (req, res) => {
   try {
-    if (!req.user) attachAuth(req);
     const uid = getCurrentUserId(req);
     if (!uid) return res.status(401).json({ error: "unauthorized" });
 
@@ -682,8 +651,10 @@ app.patch("/users/:userId", async (req, res) => {
 
     // verified: spec says "Should always be set to true"
     if (wants.verified) {
-      const verifiedValue = parseBooleanInput(payload.verified);
-      if (verifiedValue !== true) {
+      if (typeof payload.verified !== "boolean") {
+        return res.status(400).json({ error: "bad verified" });
+      }
+      if (payload.verified !== true) {
         return res.status(400).json({ error: "bad verified" });
       }
       data.verified = true;
@@ -691,11 +662,10 @@ app.patch("/users/:userId", async (req, res) => {
 
     // suspicious: boolean
     if (wants.suspicious) {
-      const suspiciousValue = parseBooleanInput(payload.suspicious);
-      if (suspiciousValue === undefined) {
+      if (typeof payload.suspicious !== "boolean") {
         return res.status(400).json({ error: "bad suspicious" });
       }
-      data.suspicious = suspiciousValue;
+      data.suspicious = payload.suspicious;
     }
 
     // role: depends on caller rank
@@ -727,7 +697,7 @@ app.patch("/users/:userId", async (req, res) => {
 
     // Enforce: suspicious user cannot be cashier
     const finalSuspicious =
-      wants.suspicious ? data.suspicious === true : !!existing.suspicious;
+      wants.suspicious ? !!payload.suspicious : !!existing.suspicious;
 
     if (targetRole === "cashier" && finalSuspicious) {
       return res.status(400).json({ error: "cashier cannot be suspicious" });
@@ -788,7 +758,6 @@ app.patch("/users/:userId", async (req, res) => {
 
 app.get("/users/me", requireAuthRegular, async (req, res) => {
   try {
-    if (!req.user) attachAuth(req);
     const uid = getCurrentUserId(req);
     if (!uid) return res.status(401).json({ error: "unauthorized" });
 
@@ -853,7 +822,6 @@ const PASSWORD_REGEX =
 // PATCH /users/me/password
 app.patch("/users/me/password", requireAuthRegular, async (req, res) => {
   try {
-    if (!req.user) attachAuth(req);
     const { old, new: newPass } = req.body || {};
     const uid = getCurrentUserId(req);
     if (!uid) return res.status(401).json({ error: "unauthorized" });
@@ -999,15 +967,18 @@ app.post("/auth/resets/:resetToken", async (req, res) => {
 });
 
 
-async function handlePurchaseTransaction(req, res) {
+app.post("/transactions", checkRole, async (req, res) => {
   try {
     if (!req.user) attachAuth(req);
 
     // ---- Validate payload ----
-    const { utorid, spent, promotionIds, remark } = req.body || {};
+    const { utorid, type, spent, promotionIds, remark } = req.body || {};
 
     if (typeof utorid !== "string" || !validUtorid(utorid)) {
       return res.status(400).json({ error: "bad utorid" });
+    }
+    if (type !== "purchase") {
+      return res.status(400).json({ error: "type must be 'purchase'" });
     }
     const amount = Number(spent);
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -1145,13 +1116,18 @@ async function handlePurchaseTransaction(req, res) {
 });
 
 
-async function handleAdjustmentTransaction(req, res) {
+// POST /transactions (adjustment)
+// Clearance: Manager or higher
+app.post("/transactions", needManager, async (req, res) => {
   try {
     if (!req.user) attachAuth(req);
 
-    const { utorid, amount, relatedId, promotionIds, remark } = req.body || {};
+    const { utorid, type, amount, relatedId, promotionIds, remark } = req.body || {};
 
     // ---- Basic validation ----
+    if (type !== "adjustment") {
+      return res.status(400).json({ error: "type must be 'adjustment'" });
+    }
     if (typeof utorid !== "string" || !validUtorid(utorid)) {
       return res.status(400).json({ error: "bad utorid" });
     }
@@ -1292,37 +1268,6 @@ async function handleAdjustmentTransaction(req, res) {
     });
   } catch (e) {
     // If we referenced a column that doesn't exist (e.g., relatedId), you can remove it above.
-    console.error(e);
-    return res.status(500).json({ error: "internal" });
-  }
-}
-
-app.post("/transactions", async (req, res) => {
-  try {
-    if (!req.user) attachAuth(req);
-    const rank = await resolveEffectiveRank(req);
-    if (rank === undefined) {
-      return res.status(401).json({ error: "unauthorized" });
-    }
-
-    const typeValue = typeof req.body?.type === "string" ? req.body.type.trim().toLowerCase() : "";
-
-    if (typeValue === "purchase") {
-      if (rank < ROLE_RANK.cashier) {
-        return res.status(403).json({ error: "forbidden" });
-      }
-      return handlePurchaseTransaction(req, res);
-    }
-
-    if (typeValue === "adjustment") {
-      if (rank < ROLE_RANK.manager) {
-        return res.status(403).json({ error: "forbidden" });
-      }
-      return handleAdjustmentTransaction(req, res);
-    }
-
-    return res.status(400).json({ error: "bad type" });
-  } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "internal" });
   }
@@ -1545,7 +1490,7 @@ app.get("/promotions/:promotionId", requireClearance("regular"), async (req, res
     })
 
     if (!promotion) {
-      return res.status(404).json({ error: "not found" })
+      return res.status(404).json({ error: "Promotion not found" })
     }
 
     const now = new Date()
@@ -1553,7 +1498,7 @@ app.get("/promotions/:promotionId", requireClearance("regular"), async (req, res
     const ended = promotion.endTime && promotion.endTime <= now
 
     if (notStarted || ended) {
-      return res.status(404).json({ error: "promotion inactive" })
+      return res.status(404).json({ error: "Promotion inactive" })
     }
 
     return res.json({
@@ -1569,7 +1514,7 @@ app.get("/promotions/:promotionId", requireClearance("regular"), async (req, res
     })
   } catch (err) {
     console.error(`Failed to fetch promotion ${promotionId}`, err)
-    return res.status(500).json({ error: "internal" })
+    return res.status(500).json({ error: "Internal Server Error" })
   }
 })
 
@@ -1817,7 +1762,7 @@ app.patch("/promotions/:promotionId", async (req, res) => {
     return res.json(response);
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: "internal" });
+    return res.status(500).json({ error: "server broke" });
   }
 });
 
@@ -2058,43 +2003,6 @@ app.get("/promotions", requireAuthRegular, async (req, res) => {
   }
 });
 
-app.post("/events", async (req, res) => {
-  try {
-    if (!req.user) attachAuth(req);
-    const rank = await resolveEffectiveRank(req);
-    if (rank === undefined) {
-      return res.status(401).json({ error: "unauthorized" });
-    }
-    if (rank < ROLE_RANK.manager) {
-      return res.status(403).json({ error: "forbidden" });
-    }
-
-    const { name, date } = req.body || {};
-    if (typeof name !== "string" || name.trim() === "") {
-      return res.status(400).json({ error: "bad payload" });
-    }
-    if (typeof date !== "string" || date.trim() === "") {
-      return res.status(400).json({ error: "bad payload" });
-    }
-    const parsedDate = new Date(date);
-    if (Number.isNaN(parsedDate.getTime())) {
-      return res.status(400).json({ error: "bad payload" });
-    }
-
-    const event = {
-      id: nextEventId++,
-      name: name.trim(),
-      date: parsedDate.toISOString()
-    };
-
-    inMemoryEvents.push(event);
-    return res.status(201).json(event);
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "internal" });
-  }
-});
-
 
 app.post("/users/mock", async (req, res) => {
   // Option A: no-op success
@@ -2104,7 +2012,6 @@ app.post("/users/mock", async (req, res) => {
 
 const server = app.listen(port, () => {
     console.log(`Server running on port ${port}`);
-    console.log("✅ All fixes applied successfully!");
 });
 
 server.on('error', (err) => {

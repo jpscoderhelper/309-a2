@@ -72,35 +72,25 @@ function requireClearance(minRole) {
   if (minRank === undefined) {
     throw new Error(`unknown role: ${minRole}`)
   }
-  return (req, res, next) => {
-    if (!req.user) attachAuth(req)
-    const tokenRole = normalizeRole(req.user && req.user.role)
-    const headerRole = normalizeRole(req.headers && req.headers["x-role"])
-    const tokenRank = tokenRole ? ROLE_RANK[tokenRole] : undefined
-    const headerRank = headerRole ? ROLE_RANK[headerRole] : undefined
+    return async (req, res, next) => {
+    try {
+      const rank = await resolveEffectiveRank(req)
 
-    let rank = undefined
+      if (rank === undefined) {
+        return res.status(401).json({ error: "unauthorized" })
+      }
 
-    if (headerRank !== undefined && (tokenRank === undefined || headerRank > tokenRank)) {
-      rank = headerRank
-    } else if (tokenRank !== undefined) {
-      rank = tokenRank
-    } else if (headerRank !== undefined) {
-      rank = headerRank
+      if (rank < minRank) {
+        return res.status(403).json({ error: "forbidden" })
+      }
+
+      return next()
+    } catch (err) {
+      console.error(err)
+      return res.status(500).json({ error: "internal" })
     }
-
-    if (rank === undefined) {
-      return res.status(401).json({ error: "unauthorized" })
-    }
-
-    if (rank < minRank) {
-      return res.status(403).json({ error: "forbidden" })
-    }
-
-    return next()
   }
 }
-
 
 
 function validUtorid(x){
@@ -148,29 +138,60 @@ function toInt(v,def){
   return def
 }
 
-function requireAuthRegular(req, res, next) {
-  // Attach JWT user if present
-  if (!req.user) attachAuth(req);
-
-  // Accept role from JWT or fallback header
-  let role = normalizeRole(req.user && req.user.role);
-  if (!role || ROLE_RANK[role] === undefined) {
-    role = normalizeRole(req.headers["x-role"]);
+async function requireAuthRegular(req, res, next) {
+  try {
+    const rank = await resolveEffectiveRank(req)
+    if (rank === undefined) {
+      return res.status(401).json({ error: "unauthorized" })
+    }
+    return next()
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: "internal" })
   }
-
-  // Must be at least a known role (regular/cashier/manager/superuser)
-  if (!role || ROLE_RANK[role] === undefined) {
-    return res.status(401).json({ error: "unauthorized" });
-  }
-
-  // All known roles are allowed for /users/me
-  return next();
 }
 
 function getCurrentUserId(req) {
   if (req.user && Number.isInteger(req.user.id)) return req.user.id;
   const fromHeader = parseInt(req.headers["x-user-id"], 10);
   return Number.isInteger(fromHeader) && fromHeader > 0 ? fromHeader : null;
+}
+async function resolveEffectiveRank(req) {
+  if (!req.user) attachAuth(req)
+
+  const tokenRole = normalizeRole(req.user && req.user.role)
+  const headerRole = normalizeRole(req.headers && req.headers["x-role"])
+  const tokenRank = tokenRole ? ROLE_RANK[tokenRole] : undefined
+  const headerRank = headerRole ? ROLE_RANK[headerRole] : undefined
+
+  if (headerRank !== undefined && (tokenRank === undefined || headerRank > tokenRank)) {
+    return headerRank
+  }
+
+  if (tokenRank !== undefined) {
+    return tokenRank
+  }
+
+  if (headerRank !== undefined) {
+    return headerRank
+  }
+
+  const uid = getCurrentUserId(req)
+  if (!uid) {
+    return undefined
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: uid },
+    select: { role: true }
+  })
+
+  if (!user) {
+    return undefined
+  }
+
+  const dbRole = normalizeRole(user.role)
+  return dbRole ? ROLE_RANK[dbRole] : undefined
 }
 
 
@@ -1503,7 +1524,7 @@ app.delete("/promotions/:promotionId", needManager, async (req, res) => {
 });
 
 
-app.patch("/promotions/:promotionId", needManager, async (req, res) => {
+app.patch("/promotions/:promotionId", async (req, res) => {
   try {
     const promoId = parseInt(req.params.promotionId, 10);
     if (!Number.isInteger(promoId) || promoId <= 0) {
@@ -1662,6 +1683,10 @@ app.patch("/promotions/:promotionId", needManager, async (req, res) => {
       return res.status(400).json({ error: "endTime must be after startTime" });
     }
 
+    const rank = await resolveEffectiveRank(req);
+    if (rank === undefined) return res.status(401).json({ error: "unauthorized" });
+    if (rank < ROLE_RANK.manager) return res.status(403).json({ error: "forbidden" });
+
     const updated = await prisma.promotion.update({
       where: { id: promoId },
       data,
@@ -1710,7 +1735,7 @@ app.patch("/promotions/:promotionId", needManager, async (req, res) => {
   }
 });
 
-app.post("/promotions", needManager, async (req, res) => {
+app.post("/promotions", async (req, res) => {
   try {
     const {
       name,
@@ -1789,7 +1814,9 @@ app.post("/promotions", needManager, async (req, res) => {
       }
       pointsValue = points;
     }
-
+    const rank = await resolveEffectiveRank(req);
+    if (rank === undefined) return res.status(401).json({ error: "unauthorized" });
+    if (rank < ROLE_RANK.manager) return res.status(403).json({ error: "forbidden" });
     const created = await prisma.promotion.create({
       data: {
         name: name.trim(),
@@ -1831,111 +1858,7 @@ app.post("/promotions", needManager, async (req, res) => {
   }
 });
 
-app.get("/promotions", needManager, async (req, res) => {
-  try {
-    if (!req.user) attachAuth(req);
 
-    const {
-      page = "1",
-      limit = "10",
-      name,
-      type,
-      started,
-      ended
-    } = req.query;
-
-    const pageNum = parseIntParam(page) ?? 1;
-    const limitNum = parseIntParam(limit) ?? 10;
-    if (pageNum <= 0 || limitNum <= 0) {
-      return res.status(400).json({ error: "bad pagination" });
-    }
-
-    const typeStr = type !== undefined ? String(type).trim().toLowerCase() : undefined;
-    if (type !== undefined && !["automatic", "onetime"].includes(typeStr)) {
-      return res.status(400).json({ error: "bad type" });
-    }
-
-    const startedBool = started !== undefined ? parseBool(started) : undefined;
-    if (started !== undefined && startedBool === undefined) {
-      return res.status(400).json({ error: "bad started" });
-    }
-
-    const endedBool = ended !== undefined ? parseBool(ended) : undefined;
-    if (ended !== undefined && endedBool === undefined) {
-      return res.status(400).json({ error: "bad ended" });
-    }
-
-    if (startedBool !== undefined && endedBool !== undefined) {
-      return res.status(400).json({ error: "cannot filter by both started and ended" });
-    }
-
-    const filters = [];
-
-    if (name && String(name).trim().length > 0) {
-      const q = String(name).trim();
-      filters.push({ name: { contains: q, mode: "insensitive" } });
-    }
-
-    if (typeStr) {
-      filters.push({ type: typeStr });
-    }
-
-    const now = new Date();
-
-    if (startedBool !== undefined) {
-      filters.push({ startTime: startedBool ? { lte: now } : { gt: now } });
-    }
-
-    if (endedBool !== undefined) {
-      if (endedBool) {
-        filters.push({ endTime: { lte: now } });
-      } else {
-        filters.push({ OR: [{ endTime: { gt: now } }, { endTime: null }] });
-      }
-    }
-
-    const where = filters.length > 0 ? { AND: filters } : {};
-
-    const skip = (pageNum - 1) * limitNum;
-    const take = limitNum;
-
-    const [count, promotions] = await Promise.all([
-      prisma.promotion.count({ where }),
-      prisma.promotion.findMany({
-        where,
-        skip,
-        take,
-        orderBy: { createdAt: "desc" },
-        select: {
-          id: true,
-          name: true,
-          type: true,
-          startTime: true,
-          endTime: true,
-          minSpending: true,
-          rate: true,
-          points: true
-        }
-      })
-    ]);
-
-    const results = promotions.map((p) => ({
-      id: p.id,
-      name: p.name,
-      type: p.type,
-      startTime: p.startTime ? p.startTime.toISOString() : null,
-      endTime: p.endTime ? p.endTime.toISOString() : null,
-      minSpending: p.minSpending ?? null,
-      rate: p.rate ?? null,
-      points: p.points ?? 0
-    }));
-
-    return res.json({ count, results });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "internal" });
-  }
-});
 
 app.get("/promotions", requireAuthRegular, async (req, res) => {
   try {
